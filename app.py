@@ -1,6 +1,7 @@
 import os
 import json
 import uuid
+import shlex
 import threading
 import queue
 import datetime
@@ -45,7 +46,7 @@ def save_jobs():
 
 
 # --- Job helpers ---------------------------------------------------------
-def new_job(url, name, scraper, admin_email):
+def new_job(url, name, scraper, admin_email, extra_args):
     job_id = uuid.uuid4().hex[:8]
     job = {
         "id": job_id,
@@ -53,6 +54,7 @@ def new_job(url, name, scraper, admin_email):
         "name": name,
         "scraper": scraper,
         "admin_email": admin_email,
+        "extra_args": extra_args,
         "status": "queued",
         "created_at": datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z",
         "log": [],
@@ -88,6 +90,8 @@ def set_status(job_id, status):
 def run_zimit(job):
     safe_name = job["name"] or job["id"]
     command = ["zimit", "--seeds", job["url"], "--name", safe_name]
+    if job.get("extra_args"):
+        command += shlex.split(job["extra_args"])
     return docker_client.containers.run(
         "ghcr.io/openzim/zimit:latest",
         command=command,
@@ -105,6 +109,8 @@ def run_mwoffliner(job):
         "--outputDirectory=/output",
         f"--filenamePrefix={safe_name}",
     ]
+    if job.get("extra_args"):
+        command += shlex.split(job["extra_args"])
     return docker_client.containers.run(
         "ghcr.io/openzim/mwoffliner:latest",
         command=command,
@@ -164,6 +170,7 @@ def submit():
     name = request.form.get("name", "").strip()
     scraper = request.form.get("scraper", "zimit")
     admin_email = request.form.get("admin_email", "").strip()
+    extra_args = request.form.get("extra_args", "").strip()
 
     if not url:
         return redirect(url_for("index"))
@@ -172,7 +179,7 @@ def submit():
     if scraper == "mwoffliner" and not admin_email:
         admin_email = "archive@example.com"
 
-    new_job(url, name, scraper, admin_email)
+    new_job(url, name, scraper, admin_email, extra_args)
     return redirect(url_for("index"))
 
 

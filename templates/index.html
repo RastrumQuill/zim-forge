@@ -42,6 +42,17 @@
         <input type="email" id="admin_email" name="admin_email" placeholder="you@example.com">
       </div>
 
+      <div class="field">
+        <label for="extra_args">Advanced options <span class="hint">(optional — raw flags appended to the scraper command, exactly as you'd type them on the command line)</span></label>
+        <input type="text" id="extra_args" name="extra_args" placeholder='--scopeIncludeRx "https://example.com/(path1|path2)/.*"'>
+        <p class="hint" style="margin-top:6px;">
+          Common ones: <code>--scopeIncludeRx "regex"</code> to widen Zimit's crawl scope beyond
+          the default (which only follows links under the same directory as your URL) — use
+          this whenever the site you want has pages living outside that directory.
+          <code>--depth N</code> limits crawl depth. For mwoffliner, e.g. <code>--format=nopic</code>.
+        </p>
+      </div>
+
       <button type="submit">Start Job</button>
     </form>
 
