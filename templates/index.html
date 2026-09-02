@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>ZIM Forge</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <header>
+    <h1>ZIM Forge</h1>
+    <p class="subtitle">Turn a website into a ZIM file. Finished files land in your Kiwix library automatically.</p>
+  </header>
+
+  <main>
+    <form id="submit-form" action="/submit" method="post">
+      <div class="field">
+        <label for="url">Site URL</label>
+        <input type="url" id="url" name="url" placeholder="https://example.com/docs/" required>
+      </div>
+
+      <div class="field">
+        <label for="name">Name <span class="hint">(used as the ZIM filename — optional, derived from URL if blank)</span></label>
+        <input type="text" id="name" name="name" placeholder="my-archive">
+      </div>
+
+      <div class="field">
+        <label>Scraper</label>
+        <div class="radio-row">
+          <label class="radio-option">
+            <input type="radio" name="scraper" value="zimit" checked onchange="toggleScraperFields()">
+            Zimit <span class="hint">— generic site, any web page</span>
+          </label>
+          <label class="radio-option">
+            <input type="radio" name="scraper" value="mwoffliner" onchange="toggleScraperFields()">
+            mwoffliner <span class="hint">— MediaWiki sites (Fandom, most wikis)</span>
+          </label>
+        </div>
+      </div>
+
+      <div class="field" id="admin-email-field" style="display:none;">
+        <label for="admin_email">Admin email <span class="hint">(required by mwoffliner — used to identify the crawler to the wiki, not stored anywhere else)</span></label>
+        <input type="email" id="admin_email" name="admin_email" placeholder="you@example.com">
+      </div>
+
+      <button type="submit">Start Job</button>
+    </form>
+
+    <section>
+      <h2>Jobs</h2>
+      <table id="jobs-table">
+        <thead>
+          <tr>
+            <th>Name</th>
+            <th>Scraper</th>
+            <th>Status</th>
+            <th>Started</th>
+            <th>Log</th>
+          </tr>
+        </thead>
+        <tbody id="jobs-body">
+          {% for job in jobs %}
+          <tr>
+            <td>{{ job.name }}</td>
+            <td>{{ job.scraper }}</td>
+            <td><span class="badge status-{{ job.status }}">{{ job.status }}</span></td>
+            <td>{{ job.created_at }}</td>
+            <td><button class="log-btn" onclick="toggleLog('{{ job.id }}')">view</button></td>
+          </tr>
+          <tr class="log-row" id="log-row-{{ job.id }}" style="display:none;">
+            <td colspan="5"><pre id="log-{{ job.id }}" class="log-box">loading…</pre></td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </section>
+  </main>
+
+  <script>
+    function toggleScraperFields() {
+      const isWiki = document.querySelector('input[name="scraper"]:checked').value === 'mwoffliner';
+      document.getElementById('admin-email-field').style.display = isWiki ? 'block' : 'none';
+    }
+
+    const openLogs = new Set();
+
+    function toggleLog(jobId) {
+      const row = document.getElementById('log-row-' + jobId);
+      const isOpen = row.style.display !== 'none';
+      row.style.display = isOpen ? 'none' : 'table-row';
+      if (isOpen) {
+        openLogs.delete(jobId);
+      } else {
+        openLogs.add(jobId);
+        refreshLog(jobId);
+      }
+    }
+
+    async function refreshLog(jobId) {
+      const res = await fetch('/logs/' + jobId);
+      const text = await res.text();
+      const box = document.getElementById('log-' + jobId);
+      if (box) {
+        box.textContent = text || '(no output yet)';
+        box.scrollTop = box.scrollHeight;
+      }
+    }
+
+    async function refreshJobs() {
+      const res = await fetch('/jobs');
+      const jobsData = await res.json();
+      const tbody = document.getElementById('jobs-body');
+      tbody.innerHTML = '';
+      for (const job of jobsData) {
+        const row = document.createElement('tr');
+        row.innerHTML = `
+          <td>${job.name}</td>
+          <td>${job.scraper}</td>
+          <td><span class="badge status-${job.status}">${job.status}</span></td>
+          <td>${job.created_at}</td>
+          <td><button class="log-btn" onclick="toggleLog('${job.id}')">view</button></td>
+        `;
+        tbody.appendChild(row);
+
+        const logRow = document.createElement('tr');
+        logRow.className = 'log-row';
+        logRow.id = 'log-row-' + job.id;
+        logRow.style.display = openLogs.has(job.id) ? 'table-row' : 'none';
+        logRow.innerHTML = `<td colspan="5"><pre id="log-${job.id}" class="log-box">loading…</pre></td>`;
+        tbody.appendChild(logRow);
+      }
+      for (const jobId of openLogs) {
+        refreshLog(jobId);
+      }
+    }
+
+    setInterval(refreshJobs, 4000);
+  </script>
+</body>
+</html>
