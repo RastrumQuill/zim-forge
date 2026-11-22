@@ -121,15 +121,18 @@
       const created = el('td');
       const logBtn = el('button', {className: 'log-btn', type: 'button', textContent: 'log'});
       const cancelBtn = el('button', {className: 'log-btn cancel-btn', type: 'button', textContent: 'cancel'});
-      const actions = el('td', {className: 'actions'}, [logBtn, cancelBtn]);
+      const retryBtn = el('button', {className: 'log-btn', type: 'button', textContent: 'run again'});
+      const actions = el('td', {className: 'actions'}, [logBtn, cancelBtn, retryBtn]);
       const row = el('tr', {}, [name, scraper, status, created, actions]);
 
       const logBox = el('pre', {className: 'log-box', textContent: 'loading…'});
-      const logRow = el('tr', {className: 'log-row', hidden: true}, [el('td', {colSpan: 5}, [logBox])]);
+      const details = el('div', {className: 'job-details'});
+      const logRow = el('tr', {className: 'log-row', hidden: true}, [el('td', {colSpan: 5}, [details, logBox])]);
 
       logBtn.addEventListener('click', () => toggleLog(job.id));
-      cancelBtn.addEventListener('click', () => cancelJob(job.id, cancelBtn));
-      return {row, logRow, logBox, name, scraper, badge, created, cancelBtn};
+      cancelBtn.addEventListener('click', () => jobAction(job.id, 'cancel', cancelBtn, 'Cancel this job?'));
+      retryBtn.addEventListener('click', () => jobAction(job.id, 'retry', retryBtn, 'Queue this job again with the same settings?'));
+      return {row, logRow, logBox, details, name, scraper, badge, created, cancelBtn, retryBtn};
     }
 
     function updateRow(r, job) {
@@ -139,8 +142,34 @@
       r.badge.textContent = job.status;
       r.badge.className = 'badge status-' + job.status;
       r.created.textContent = fmtTime(job.created_at);
-      r.cancelBtn.hidden = !(job.status === 'queued' || job.status === 'running');
+      const active = job.status === 'queued' || job.status === 'running';
+      r.cancelBtn.hidden = !active;
+      r.retryBtn.hidden = active;
       r.logRow.hidden = !openLogs.has(job.id);
+      const sig = JSON.stringify([job.status, job.outputs, job.image_digest, job.finished_at]);
+      if (r.detailsSig !== sig) { r.detailsSig = sig; renderDetails(r.details, job); }
+    }
+
+    function fmtSize(n) {
+      const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+      let i = 0;
+      while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
+      return (i ? n.toFixed(1) : n) + ' ' + units[i];
+    }
+
+    function renderDetails(box, job) {
+      box.replaceChildren();
+      const line = (label, value) => box.append(el('div', {}, [el('span', {className: 'hint', textContent: label + ' '}), value]));
+      line('URL', job.url);
+      if (job.extra_args) line('Options', job.extra_args);
+      if (job.image_digest) line('Scraper image', job.image_digest);
+      if (job.started_at) line('Started', fmtTime(job.started_at));
+      if (job.finished_at) line('Finished', fmtTime(job.finished_at));
+      for (const out of job.outputs || []) {
+        line('Output', `${out.file} (${fmtSize(out.size)})`);
+        line('SHA-256', el('code', {textContent: out.sha256}));
+      }
+      line('', el('a', {href: 'logs/' + encodeURIComponent(job.id) + '/full', textContent: 'Download full log'}));
     }
 
     function render() {
@@ -180,17 +209,19 @@
       } catch (e) { /* connection banner is handled by refreshJobs */ }
     }
 
-    async function cancelJob(jobId, btn) {
-      if (!confirm('Cancel this job?')) return;
+    async function jobAction(jobId, action, btn, question) {
+      if (!confirm(question)) return;
       btn.disabled = true;
       try {
-        const res = await fetch('jobs/' + encodeURIComponent(jobId) + '/cancel', {
+        const res = await fetch('jobs/' + encodeURIComponent(jobId) + '/' + action, {
           method: 'POST', credentials: 'same-origin', headers: {'X-CSRF-Token': CSRF_TOKEN},
         });
         if (!res.ok) {
           const data = await res.json().catch(() => ({}));
-          alert('Could not cancel: ' + (data.error || res.status));
+          alert('Could not ' + action + ': ' + (data.error || res.status));
         }
+      } catch (e) {
+        alert('Could not ' + action + ': server unreachable');
       } finally {
         btn.disabled = false;
         refreshJobs();

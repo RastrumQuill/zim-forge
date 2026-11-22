@@ -9,38 +9,39 @@ Kiwix library folder.
 ## Running it
 
 ZIM Forge needs the Docker socket so it can start scraper containers.
-**Anything that can reach its web port can start containers on your Docker host**,
-so set `ZIMFORGE_PASSWORD` unless the port is only reachable by you.
+**Anything that can reach its web port can start containers on your Docker host.**
+If the port is reachable by anyone other than you, set `ZIMFORGE_PASSWORD`.
 
-Example `docker-compose.yml` (Linux host):
+1. Copy `.env.example` to `.env` and set `LIBRARY_HOST_PATH` to your Kiwix
+   library folder **as the Docker host sees it**:
+   - Linux: `LIBRARY_HOST_PATH=/srv/kiwix/library`
+   - Docker Desktop on Windows: `LIBRARY_HOST_PATH=C:\Users\you\kiwix-library`
+2. Start it:
 
-```yaml
-services:
-  zim-forge:
-    build: .
-    ports:
-      - "5000:5000"
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-      - ./data:/data
-    environment:
-      LIBRARY_HOST_PATH: /srv/kiwix/library   # path on the HOST, not in this container
-      ZIMFORGE_PASSWORD: change-me
-    restart: unless-stopped
-```
+   ```bash
+   docker compose up -d --build
+   ```
 
-### Docker Desktop on Windows
+3. Open <http://localhost:5000>.
 
-Same file, but `LIBRARY_HOST_PATH` must be a Windows path, because the scraper
-containers mount it from your PC:
+The included `docker-compose.yml` also mounts the library into ZIM Forge itself
+(at `/library`), which enables the free-space check and output verification
+described below.
 
-```yaml
-    environment:
-      LIBRARY_HOST_PATH: 'C:\Users\you\kiwix-library'
-```
+## What a job records
 
-The socket mount stays `/var/run/docker.sock:/var/run/docker.sock`. Docker Desktop
-provides it.
+Each job keeps what's needed to trust the result later:
+
+- **Output verification.** A job only counts as a success if a new ZIM file
+  appeared in the library. Its filename, size and SHA-256 are recorded.
+- **Provenance.** The exact scraper image digest and command line are saved with
+  the job and written to its log.
+- **Full log.** The page shows the last 500 lines; the complete timestamped log
+  is kept in `data/logs/` and can be downloaded from the job's details.
+- **Free-space check.** A job won't start with less than `MIN_FREE_GB` free.
+
+Verification and the free-space check need `LIBRARY_PATH` (set for you in the
+compose file). Without it, success is judged by the scraper's exit code alone.
 
 ## Settings
 
@@ -52,6 +53,11 @@ provides it.
 | `APP_DATA_DIR` | `/data` | Where job history and the session key are stored. |
 | `ZIMIT_IMAGE` | `ghcr.io/openzim/zimit:latest` | Pin to a version tag for reproducible runs. |
 | `MWOFFLINER_IMAGE` | `ghcr.io/openzim/mwoffliner:latest` | Pin to a version tag for reproducible runs. |
+| `LIBRARY_PATH` | *(unset)* | Where the library is mounted inside ZIM Forge's own container. Enables verification and the free-space check. |
+| `MIN_FREE_GB` | `5` | Minimum free space in the library before a job may start. |
+| `PULL_IMAGES` | `true` | Check for a newer scraper image before each job. |
+| `SCRAPER_MEMORY` | *(none)* | Memory cap for scraper containers, e.g. `8g`. |
+| `SCRAPER_CPUS` | *(none)* | CPU cap for scraper containers, e.g. `4`. |
 | `ZIMIT_SHM_SIZE` | `1g` | Shared memory for Zimit's Chromium. Lower values crash on big sites. |
 | `JOB_TIMEOUT_HOURS` | `0` (none) | Stop and fail jobs that run longer than this. |
 | `MAX_JOBS_KEPT` | `100` | Oldest finished jobs beyond this are removed from history. |
@@ -73,7 +79,17 @@ identifies itself with your admin email) or for a database dump.
 
 ## Notes
 
-- One job runs at a time. Jobs can be cancelled from the jobs table.
+- One job runs at a time. Jobs can be cancelled or run again from the jobs table.
 - If the app restarts mid-job, it reattaches to the still-running scraper
   container. Queued jobs are resumed.
 - Two queued or running jobs can't share a name, since they'd write the same file.
+
+## Tests
+
+```bash
+pip install -r requirements.txt
+python tests/test_app.py
+```
+
+The tests use a fake Docker client and a local fake site, so they need neither
+Docker nor internet access.

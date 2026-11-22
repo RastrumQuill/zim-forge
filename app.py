@@ -1,5 +1,7 @@
 import os
 import re
+import shutil
+import hashlib
 import json
 import time
 import uuid
@@ -17,7 +19,7 @@ from urllib.parse import urlparse
 
 from flask import (
     Flask, render_template, request, redirect, url_for, jsonify, Response,
-    session, abort,
+    session, abort, send_file,
 )
 import docker
 from docker.errors import NotFound
@@ -49,6 +51,7 @@ if not LIBRARY_HOST_PATH:
 APP_DATA_DIR = os.environ.get("APP_DATA_DIR", "/data")
 JOBS_FILE = os.path.join(APP_DATA_DIR, "jobs.json")
 SECRET_KEY_FILE = os.path.join(APP_DATA_DIR, "secret_key")
+LOG_DIR = os.path.join(APP_DATA_DIR, "logs")
 
 ZIMIT_IMAGE = os.environ.get("ZIMIT_IMAGE", "ghcr.io/openzim/zimit:latest")
 MWOFFLINER_IMAGE = os.environ.get("MWOFFLINER_IMAGE", "ghcr.io/openzim/mwoffliner:latest")
@@ -64,6 +67,16 @@ ALLOW_PRIVATE_URLS = env_bool("ALLOW_PRIVATE_URLS", False)
 # anything other than you: this app controls the Docker daemon.
 AUTH_USERNAME = os.environ.get("ZIMFORGE_USERNAME", "admin")
 AUTH_PASSWORD = os.environ.get("ZIMFORGE_PASSWORD", "")
+# Optional: where the library folder is mounted INSIDE this app's container.
+# When set, ZIM Forge checks free disk space before a job and verifies that a
+# ZIM file was actually produced (recording its size and SHA-256) afterwards.
+LIBRARY_PATH = os.environ.get("LIBRARY_PATH", "").strip()
+MIN_FREE_GB = float(os.environ.get("MIN_FREE_GB", "5") or 0)
+# Check the registry for a newer scraper image before each job.
+PULL_IMAGES = env_bool("PULL_IMAGES", True)
+# Optional caps on scraper containers, e.g. SCRAPER_MEMORY=8g SCRAPER_CPUS=4
+SCRAPER_MEMORY = os.environ.get("SCRAPER_MEMORY", "").strip()
+SCRAPER_CPUS = float(os.environ.get("SCRAPER_CPUS", "0") or 0)
 # Before starting a scraper, check the site isn't serving a bot challenge.
 BOT_CHECK = env_bool("BOT_CHECK", True)
 HOST = os.environ.get("HOST", "0.0.0.0")
@@ -88,6 +101,7 @@ NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 app = Flask(__name__)
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 docker_client = docker.from_env()
 
 jobs = {}
@@ -176,6 +190,10 @@ def prune_jobs_locked():
         finished.sort(key=lambda j: j["created_at"])
         for j in finished[:excess]:
             del jobs[j["id"]]
+            try:
+                os.remove(log_file_path(j["id"]))
+            except OSError:
+                pass
 
 
 # --- Job helpers -------------------------------------------------------------
@@ -196,6 +214,11 @@ def new_job(url, name, scraper, admin_email, extra_args):
         "log": [],
         "container_id": None,
         "cancel_requested": False,
+        # Provenance: exactly what ran, and what it produced.
+        "image": None,
+        "image_digest": None,
+        "command": None,
+        "outputs": [],
     }
     with jobs_lock:
         jobs[job_id] = job
@@ -205,7 +228,18 @@ def new_job(url, name, scraper, admin_email, extra_args):
     return job_id
 
 
+def log_file_path(job_id):
+    return os.path.join(LOG_DIR, f"{job_id}.log")
+
+
 def append_log(job_id, line):
+    """Add a line to the job's log: the complete log on disk, the tail in memory."""
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        with open(log_file_path(job_id), "a", encoding="utf-8") as f:
+            f.write(f"{utcnow_iso()} {line}\n")
+    except OSError:
+        pass
     if len(line) > MAX_LOG_LINE_CHARS:
         line = line[:MAX_LOG_LINE_CHARS] + " …"
     with jobs_lock:
@@ -225,12 +259,13 @@ def finish_job(job_id, status, exit_code=None):
             job["status"] = status
             job["exit_code"] = exit_code
             job["finished_at"] = utcnow_iso()
+            job.pop("zims_before", None)
     save_jobs()
 
 
 def public_job(job):
     """Job fields for the browser: everything except the (large) log."""
-    return {k: v for k, v in job.items() if k != "log"}
+    return {k: v for k, v in job.items() if k not in ("log", "zims_before")}
 
 
 # --- Input validation --------------------------------------------------------
@@ -319,34 +354,126 @@ def validate_submission(form):
 
 
 # --- Scraper invocations -----------------------------------------------------
-def container_common(job):
-    return {
+def build_run(job):
+    """Returns (image, command, extra docker run kwargs) for a job."""
+    extra = shlex.split(job["extra_args"]) if job.get("extra_args") else []
+    if job["scraper"] == "mwoffliner":
+        command = [
+            "mwoffliner",
+            f"--mwUrl={job['url']}",
+            f"--adminEmail={job['admin_email']}",
+            "--outputDirectory=/output",
+            f"--filenamePrefix={job['name']}",
+        ] + extra
+        return MWOFFLINER_IMAGE, command, {}
+    command = ["zimit", "--seeds", job["url"], "--name", job["name"], "--output", "/output"] + extra
+    return ZIMIT_IMAGE, command, {"shm_size": ZIMIT_SHM_SIZE}
+
+
+def ensure_image(job_id, image):
+    """Make sure the scraper image is present (and current); returns its digest."""
+    if PULL_IMAGES:
+        append_log(job_id, f"Checking for the latest {image} (a first download can take several minutes)…")
+        try:
+            docker_client.images.pull(image)
+        except Exception as e:
+            try:
+                docker_client.images.get(image)
+            except Exception:
+                raise RuntimeError(f"could not download {image}: {e}")
+            append_log(job_id, f"Couldn't check for a newer image ({e}); using the local copy.")
+    img = docker_client.images.get(image)
+    digests = img.attrs.get("RepoDigests") or []
+    return digests[0] if digests else img.id
+
+
+def start_container(job_id, job):
+    image, command, extra_kwargs = build_run(job)
+    digest = ensure_image(job_id, image)
+    with jobs_lock:
+        live = jobs.get(job_id)
+        if live:
+            live.update(image=image, image_digest=digest, command=command)
+            if live["cancel_requested"]:
+                return None
+    append_log(job_id, f"Image: {digest}")
+    append_log(job_id, "Command: " + shlex.join(command))
+    kwargs = {
         "volumes": {LIBRARY_HOST_PATH: {"bind": "/output", "mode": "rw"}},
         "detach": True,
-        "name": f"zimforge-{job['id']}",
-        "labels": {"zim-forge.job": job["id"]},
+        "name": f"zimforge-{job_id}",
+        "labels": {"zim-forge.job": job_id},
+        **extra_kwargs,
     }
+    if SCRAPER_MEMORY:
+        kwargs["mem_limit"] = SCRAPER_MEMORY
+    if SCRAPER_CPUS > 0:
+        kwargs["nano_cpus"] = int(SCRAPER_CPUS * 1e9)
+    return docker_client.containers.run(image, command=command, **kwargs)
 
 
-def run_zimit(job):
-    command = ["zimit", "--seeds", job["url"], "--name", job["name"], "--output", "/output"]
-    if job.get("extra_args"):
-        command += shlex.split(job["extra_args"])
-    return docker_client.containers.run(
-        ZIMIT_IMAGE, command=command, shm_size=ZIMIT_SHM_SIZE, **container_common(job))
+# --- Output verification -----------------------------------------------------
+def library_available():
+    return bool(LIBRARY_PATH) and os.path.isdir(LIBRARY_PATH)
 
 
-def run_mwoffliner(job):
-    command = [
-        "mwoffliner",
-        f"--mwUrl={job['url']}",
-        f"--adminEmail={job['admin_email']}",
-        "--outputDirectory=/output",
-        f"--filenamePrefix={job['name']}",
-    ]
-    if job.get("extra_args"):
-        command += shlex.split(job["extra_args"])
-    return docker_client.containers.run(MWOFFLINER_IMAGE, command=command, **container_common(job))
+def list_zims():
+    """{filename: [size, mtime_ns]} for ZIM files in the library folder."""
+    found = {}
+    for entry in os.scandir(LIBRARY_PATH):
+        if entry.name.lower().endswith(".zim") and entry.is_file():
+            st = entry.stat()
+            found[entry.name] = [st.st_size, st.st_mtime_ns]
+    return found
+
+
+def human_size(n):
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(4 * 1024 * 1024), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def preflight_disk(job_id):
+    """Returns an error string if there's too little free space, else None."""
+    free_gb = shutil.disk_usage(LIBRARY_PATH).free / 1024 ** 3
+    append_log(job_id, f"Free space in library: {free_gb:.1f} GB")
+    if free_gb < MIN_FREE_GB:
+        return (f"Only {free_gb:.1f} GB free in the library folder; at least {MIN_FREE_GB:g} GB "
+                "is required (MIN_FREE_GB). Free up space and run the job again.")
+    return None
+
+
+def collect_outputs(job_id):
+    """Find ZIM files this job created or changed; record size and checksum.
+
+    Returns the list of outputs, or None if the library isn't mounted.
+    """
+    if not library_available():
+        return None
+    with jobs_lock:
+        before = (jobs.get(job_id) or {}).get("zims_before") or {}
+    outputs = []
+    for name, stat in sorted(list_zims().items()):
+        if before.get(name) == stat:
+            continue
+        append_log(job_id, f"Verifying {name} ({human_size(stat[0])})…")
+        digest = sha256_file(os.path.join(LIBRARY_PATH, name))
+        outputs.append({"file": name, "size": stat[0], "sha256": digest})
+        append_log(job_id, f"Output: {name}  {human_size(stat[0])}  sha256={digest}")
+    with jobs_lock:
+        job = jobs.get(job_id)
+        if job:
+            job["outputs"] = outputs
+    return outputs
 
 
 BOT_CHECK_MESSAGE = (
@@ -443,10 +570,17 @@ def supervise(job_id, container, reattached=False):
             finish_job(job_id, "cancelled", exit_code)
         elif timed_out.is_set():
             finish_job(job_id, "failed", exit_code)
+        elif exit_code != 0:
+            append_log(job_id, f"Scraper exited with code {exit_code}.")
+            finish_job(job_id, "failed", exit_code)
         else:
-            if exit_code != 0:
-                append_log(job_id, f"Scraper exited with code {exit_code}.")
-            finish_job(job_id, "success" if exit_code == 0 else "failed", exit_code)
+            outputs = collect_outputs(job_id)
+            if outputs is not None and not outputs:
+                append_log(job_id, "Scraper exited cleanly but no new ZIM file appeared in the library. "
+                                   "Treating this as a failure.")
+                finish_job(job_id, "failed", exit_code)
+            else:
+                finish_job(job_id, "success", exit_code)
     finally:
         if timer:
             timer.cancel()
@@ -483,9 +617,22 @@ def run_job(job_id):
             finish_job(job_id, "failed")
             return
 
+    if library_available():
+        problem = preflight_disk(job_id)
+        if problem:
+            append_log(job_id, problem)
+            finish_job(job_id, "failed")
+            return
+        with jobs_lock:
+            job["zims_before"] = list_zims()
+
     container = None
     try:
-        container = run_mwoffliner(spec) if spec["scraper"] == "mwoffliner" else run_zimit(spec)
+        container = start_container(job_id, spec)
+        if container is None:  # cancelled while the image was downloading
+            append_log(job_id, "Cancelled.")
+            finish_job(job_id, "cancelled")
+            return
         with jobs_lock:
             job["container_id"] = container.id
             cancel_now = job["cancel_requested"]
@@ -533,7 +680,13 @@ def reattach(job_id, container_id):
     else:
         exit_code = container.attrs.get("State", {}).get("ExitCode", 1)
         append_log(job_id, f"Scraper finished while the app was down (exit code {exit_code}).")
-        finish_job(job_id, "success" if exit_code == 0 else "failed", exit_code)
+        ok = exit_code == 0
+        if ok:
+            outputs = collect_outputs(job_id)
+            if outputs is not None and not outputs:
+                append_log(job_id, "No new ZIM file appeared in the library. Treating this as a failure.")
+                ok = False
+        finish_job(job_id, "success" if ok else "failed", exit_code)
         try:
             container.remove(force=True)
         except Exception:
@@ -636,6 +789,32 @@ def logs(job_id):
     return Response(text, mimetype="text/plain")
 
 
+@app.route("/logs/<job_id>/full")
+def full_log(job_id):
+    with jobs_lock:
+        job = jobs.get(job_id)  # also guarantees job_id is a real id, not a path
+        name = job["name"] if job else None
+    if not job or not os.path.exists(log_file_path(job_id)):
+        return "no log file for this job", 404
+    return send_file(log_file_path(job_id), mimetype="text/plain", as_attachment=True,
+                     download_name=f"{name}-{job_id}.log")
+
+
+@app.route("/jobs/<job_id>/retry", methods=["POST"])
+@csrf_protected
+def retry(job_id):
+    with jobs_lock:
+        job = jobs.get(job_id)
+        if not job:
+            return jsonify(error="no such job"), 404
+        if job["status"] not in FINISHED_STATUSES:
+            return jsonify(error=f"job is still {job['status']}"), 409
+        if any(j["name"] == job["name"] and j["status"] in ACTIVE_STATUSES for j in jobs.values()):
+            return jsonify(error="a job with this name is already queued or running"), 409
+        params = {k: job[k] for k in ("url", "name", "scraper", "admin_email", "extra_args")}
+    return jsonify(ok=True, id=new_job(**params))
+
+
 @app.route("/jobs/<job_id>/cancel", methods=["POST"])
 @csrf_protected
 def cancel(job_id):
@@ -664,6 +843,11 @@ def start_background():
     recover_jobs()
     threading.Thread(target=worker_loop, daemon=True, name="worker").start()
     threading.Thread(target=flusher_loop, daemon=True, name="flusher").start()
+    if LIBRARY_PATH and not os.path.isdir(LIBRARY_PATH):
+        log.warning("LIBRARY_PATH=%s is not a folder inside this container; disk-space checks "
+                    "and output verification are disabled.", LIBRARY_PATH)
+    elif not LIBRARY_PATH:
+        log.info("LIBRARY_PATH is not set; disk-space checks and output verification are disabled.")
     if not AUTH_PASSWORD:
         log.warning("ZIMFORGE_PASSWORD is not set: anyone who can reach port %s can start "
                     "containers on this Docker host. Set a password unless the port is private.", PORT)

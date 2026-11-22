@@ -169,3 +169,11 @@ code {
   border-radius: 4px;
   font-size: 0.9em;
 }
+
+.job-details {
+  font-size: 0.85em;
+  margin-bottom: 8px;
+  overflow-wrap: anywhere;
+}
+.job-details div { margin-bottom: 2px; }
+.job-details a { color: var(--accent); }
