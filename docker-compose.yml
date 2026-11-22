@@ -1,7 +1,11 @@
 # Copy .env.example to .env and set LIBRARY_HOST_PATH before running:
-#   docker compose up -d --build
+#   docker compose up -d
+# Uses the image published from this repo's main branch. To update, pull the
+# new image (docker compose pull, or the Update button in Dockge) and restart.
+# To run your local checkout instead: docker compose up -d --build
 services:
   zim-forge:
+    image: ghcr.io/rastrumquill/zim-forge:latest
     build: .
     ports:
       - "5000:5000"

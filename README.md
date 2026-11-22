@@ -19,8 +19,13 @@ If the port is reachable by anyone other than you, set `ZIMFORGE_PASSWORD`.
 2. Start it:
 
    ```bash
-   docker compose up -d --build
+   docker compose up -d
    ```
+
+   This pulls the image published from the `main` branch
+   (`ghcr.io/rastrumquill/zim-forge:latest`). To update later, run
+   `docker compose pull` and `docker compose up -d`, or press **Update** in
+   Dockge. To run a local checkout instead, add `--build`.
 
 3. Open <http://localhost:5000>.
 
