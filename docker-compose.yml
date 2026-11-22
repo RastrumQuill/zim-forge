@@ -12,11 +12,17 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ./data:/data
-      # Lets ZIM Forge check free space and verify the ZIM files it produces.
+      # Lets ZIM Forge check free space, verify the ZIM files it produces and
+      # clean up temp folders left by failed crawls.
       - ${LIBRARY_HOST_PATH}:/library
+      # Where "File mirror" jobs store downloads. Keep it outside the library.
+      - ${MIRROR_HOST_PATH}:/mirrors:ro
     environment:
       LIBRARY_HOST_PATH: ${LIBRARY_HOST_PATH}
       LIBRARY_PATH: /library
+      MIRROR_HOST_PATH: ${MIRROR_HOST_PATH}
+      MIRROR_PATH: /mirrors
+      KIWIX_CONTAINER: ${KIWIX_CONTAINER:-}
       ZIMFORGE_PASSWORD: ${ZIMFORGE_PASSWORD:-}
       SCRAPER_MEMORY: ${SCRAPER_MEMORY:-}
       SCRAPER_CPUS: ${SCRAPER_CPUS:-}

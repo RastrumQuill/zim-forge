@@ -17,10 +17,13 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WORK = tempfile.mkdtemp(prefix="zimforge-test-")
 DATA = os.path.join(WORK, "data")
 LIBRARY = os.path.join(WORK, "library")
+MIRRORS = os.path.join(WORK, "mirrors")
 os.makedirs(LIBRARY)
+os.makedirs(MIRRORS)
 os.environ.update(
     LIBRARY_HOST_PATH="C:\\kiwix", LIBRARY_PATH=LIBRARY, APP_DATA_DIR=DATA,
     ALLOW_PRIVATE_URLS="true", MIN_FREE_GB="0", SCRAPER_MEMORY="2g", SCRAPER_CPUS="1.5",
+    MIRROR_HOST_PATH="/mnt/mirrors", MIRROR_PATH=MIRRORS, KIWIX_CONTAINER="kiwix-serve",
 )
 
 import docker  # noqa: E402
@@ -32,6 +35,8 @@ class FakeContainer:
         self.id, self.chunks, self.code, self.delay, self.status = cid, chunks, code, delay, status
         self.writes = writes  # (filename, bytes) "ZIM" the scraper produces
         self.removed = self.stopped = False
+        self.restarts = 0
+        self.before_exit = None  # optional callable run when the "scraper" ends
         self.attrs = {"State": {"ExitCode": code}}
 
     def logs(self, **kw):
@@ -43,6 +48,11 @@ class FakeContainer:
         if self.writes:
             with open(os.path.join(LIBRARY, self.writes[0]), "wb") as f:
                 f.write(self.writes[1])
+        if self.before_exit:
+            self.before_exit()
+
+    def restart(self):
+        self.restarts += 1
 
     def wait(self):
         return {"StatusCode": 137 if self.stopped else self.code}
@@ -124,6 +134,8 @@ import app as A  # noqa: E402
 
 A.start_background()
 fc = FakeClient.containers
+kiwix = FakeContainer("kiwix-serve", [])
+fc.by_id["kiwix-serve"] = kiwix
 c = A.app.test_client()
 
 
@@ -202,6 +214,67 @@ assert wait_status(job_named("nodisk")["id"], ("success", "failed")) == "failed"
 A.MIN_FREE_GB = 0
 check("low disk space stops the job before it starts")
 
+# --- kiwix restarted after a new ZIM ---
+assert kiwix.restarts >= 1
+check("kiwix restarted after new ZIM")
+
+# --- failed zimit job: leftover temp folder is removed ---
+os.makedirs(os.path.join(LIBRARY, ".tmpkeepme"))  # existed before the job: must survive
+leaver = FakeContainer("leaver", [b"crawl failed\n"], code=9)
+leaver.before_exit = lambda: os.makedirs(os.path.join(LIBRARY, ".tmpabc123", "collections"))
+fc.next = leaver
+post(url=BASE + "/ok", name="leaver")
+assert wait_status(job_named("leaver")["id"], ("success", "failed")) == "failed"
+assert not os.path.exists(os.path.join(LIBRARY, ".tmpabc123")) and os.path.isdir(os.path.join(LIBRARY, ".tmpkeepme"))
+check("leftover temp folder cleaned up; pre-existing one untouched")
+
+# --- file mirror ---
+assert b"end the URL with" in post(url=BASE + "/files", scraper="mirror").data
+assert b"-P" in post(url=BASE + "/files/", scraper="mirror", extra_args="-P /tmp").data
+
+
+def fake_download(name, files):
+    def run():
+        root = os.path.join(MIRRORS, name, "host", "files")
+        os.makedirs(root, exist_ok=True)
+        for filename in files:
+            with open(os.path.join(root, filename), "wb") as f:
+                f.write(b"data")
+        with open(os.path.join(MIRRORS, name, "SHA256SUMS"), "w") as f:
+            f.write("manifest")
+    return run
+
+
+restarts = kiwix.restarts
+m = FakeContainer("mirror1", [b"URL:... -> a.bin\n"], code=0)
+m.before_exit = fake_download("my-files", ["a.bin", "b.zip"])
+fc.next = m
+post(url=BASE + "/files/", scraper="mirror", name="my-files", extra_args="--level=2")
+mj = job_named("my-files")
+assert wait_status(mj["id"], ("success", "failed")) == "success", mj["log"]
+image, cmd, kw, _ = fc.made[-1]
+assert image == A.MIRROR_IMAGE and cmd[:2] == ["sh", "-c"] and cmd[3:5] == ["mirror", "my-files"]
+assert "--no-parent" in cmd and cmd[-2:] == ["--level=2", BASE + "/files/"]
+assert list(kw["volumes"]) == ["/mnt/mirrors"] and "shm_size" not in kw
+assert mj["outputs"][0]["file"] == "my-files/ (2 files)" and mj["outputs"][0]["size"] == 8
+assert mj["outputs"][0]["sha256"] == hashlib.sha256(b"manifest").hexdigest() and not mj["note"]
+assert kiwix.restarts == restarts
+check("file mirror job")
+
+m = FakeContainer("mirror2", [b"ERROR 404\n"], code=8)
+m.before_exit = fake_download("partial", ["a.bin"])
+fc.next = m
+post(url=BASE + "/files/", scraper="mirror", name="partial")
+pj = job_named("partial")
+assert wait_status(pj["id"], ("success", "failed")) == "success" and "could not be downloaded" in pj["note"]
+fc.next = FakeContainer("mirror3", [b"ERROR 404\n"], code=91)
+post(url=BASE + "/files/", scraper="mirror", name="nothing")
+assert wait_status(job_named("nothing")["id"], ("success", "failed")) == "failed"
+fc.next = FakeContainer("mirror4", [b"network down\n"], code=4)
+post(url=BASE + "/files/", scraper="mirror", name="netfail")
+assert wait_status(job_named("netfail")["id"], ("success", "failed")) == "failed"
+check("mirror: partial download noted, empty and network failures fail")
+
 # --- derived name, bot challenge ---
 post(url=BASE + "/ok/page.php?id=3")
 assert wait_status(job_named("page")["id"], ("success",))
@@ -255,7 +328,8 @@ for i, (status, cid) in enumerate([("queued", None), ("running", "done"), ("runn
         "id": f"r{i}", "url": BASE + "/ok", "name": f"r{i}", "scraper": "zimit", "admin_email": "",
         "extra_args": "", "status": status, "created_at": f"2026-01-0{i + 1}T00:00:00Z", "started_at": None,
         "finished_at": None, "exit_code": None, "log": [], "container_id": cid, "cancel_requested": False,
-        "image": None, "image_digest": None, "command": None, "outputs": [], "zims_before": A.list_zims(),
+        "image": None, "image_digest": None, "command": None, "outputs": [], "note": None,
+        "zims_before": A.list_zims(),
     }
 A.recover_jobs()
 for i in range(4):

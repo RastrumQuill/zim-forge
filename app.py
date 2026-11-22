@@ -77,6 +77,18 @@ PULL_IMAGES = env_bool("PULL_IMAGES", True)
 # Optional caps on scraper containers, e.g. SCRAPER_MEMORY=8g SCRAPER_CPUS=4
 SCRAPER_MEMORY = os.environ.get("SCRAPER_MEMORY", "").strip()
 SCRAPER_CPUS = float(os.environ.get("SCRAPER_CPUS", "0") or 0)
+# File mirroring (wget). MIRROR_HOST_PATH is a folder ON THE DOCKER HOST where
+# mirrored files are stored, one subfolder per job. Keep it outside the ZIM
+# library. MIRROR_PATH is the same folder as mounted inside this container
+# (optional; enables the free-space check and file counts).
+MIRROR_HOST_PATH = os.environ.get("MIRROR_HOST_PATH", "").strip()
+MIRROR_PATH = os.environ.get("MIRROR_PATH", "").strip()
+# The mirror job runs wget from ZIM Forge's own image.
+MIRROR_IMAGE = os.environ.get("MIRROR_IMAGE", "ghcr.io/rastrumquill/zim-forge:latest")
+MIRROR_WAIT_SECONDS = os.environ.get("MIRROR_WAIT_SECONDS", "0.5")
+# Optional: name of your kiwix-serve container. It's restarted after each new
+# ZIM so the file shows up without manual steps.
+KIWIX_CONTAINER = os.environ.get("KIWIX_CONTAINER", "").strip()
 # Before starting a scraper, check the site isn't serving a bot challenge.
 BOT_CHECK = env_bool("BOT_CHECK", True)
 HOST = os.environ.get("HOST", "0.0.0.0")
@@ -86,7 +98,7 @@ MAX_LOG_LINES = 500
 SAVE_INTERVAL_SECONDS = 5
 MAX_LOG_LINE_CHARS = 2000
 
-SCRAPERS = ("zimit", "mwoffliner")
+SCRAPERS = ("zimit", "mwoffliner", "mirror")
 ACTIVE_STATUSES = ("queued", "running")
 FINISHED_STATUSES = ("success", "failed", "cancelled")
 
@@ -95,7 +107,30 @@ FINISHED_STATUSES = ("success", "failed", "cancelled")
 RESERVED_FLAGS = {
     "zimit": {"--name", "--output", "--zim-file"},
     "mwoffliner": {"--mwUrl", "--adminEmail", "--outputDirectory", "--filenamePrefix"},
+    "mirror": {"-P", "--directory-prefix", "-O", "--output-document", "-o", "--output-file",
+               "-a", "--append-output", "-e", "--execute", "-i", "--input-file", "--config"},
 }
+
+# Runs inside the mirror container: download into /output/<name>, then write a
+# SHA256SUMS manifest covering every file. Arguments arrive as "$@", so nothing
+# from the job is ever interpreted by the shell.
+MIRROR_SCRIPT = r'''
+name="$1"; shift
+out="${MIRROR_OUT:-/output}/$name"
+mkdir -p "$out" && cd "$out" || exit 90
+wget "$@"
+code=$?
+echo "wget finished with exit code $code; writing checksums (this can take a while)..."
+find . -type f ! -name SHA256SUMS ! -name SHA256SUMS.tmp -print0 | sort -z | xargs -0 -r sha256sum > SHA256SUMS.tmp \
+  && mv SHA256SUMS.tmp SHA256SUMS
+count=$(find . -type f ! -name SHA256SUMS | wc -l)
+echo "Mirror holds $count files, $(du -sh . | cut -f1) in total."
+[ "$count" -eq 0 ] && exit 91
+exit $code
+'''
+# wget exit code 8 = "server issued an error response" for at least one URL
+# (typically a dead link); the rest of the mirror is still complete.
+MIRROR_OK_EXIT_CODES = (0, 8)
 
 NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
@@ -219,6 +254,7 @@ def new_job(url, name, scraper, admin_email, extra_args):
         "image_digest": None,
         "command": None,
         "outputs": [],
+        "note": None,
     }
     with jobs_lock:
         jobs[job_id] = job
@@ -253,6 +289,8 @@ def append_log(job_id, line):
 
 
 def finish_job(job_id, status, exit_code=None):
+    if status != "success":
+        cleanup_temp_dirs(job_id)
     with jobs_lock:
         job = jobs.get(job_id)
         if job:
@@ -260,12 +298,13 @@ def finish_job(job_id, status, exit_code=None):
             job["exit_code"] = exit_code
             job["finished_at"] = utcnow_iso()
             job.pop("zims_before", None)
+            job.pop("tmp_before", None)
     save_jobs()
 
 
 def public_job(job):
     """Job fields for the browser: everything except the (large) log."""
-    return {k: v for k, v in job.items() if k not in ("log", "zims_before")}
+    return {k: v for k, v in job.items() if k not in ("log", "zims_before", "tmp_before")}
 
 
 # --- Input validation --------------------------------------------------------
@@ -323,6 +362,15 @@ def validate_submission(form):
     elif parsed.hostname:
         name = default_name(parsed)
 
+    if scraper == "mirror":
+        if not MIRROR_HOST_PATH:
+            errors.append("File mirroring isn't set up: set MIRROR_HOST_PATH to a folder on the "
+                          "Docker host (outside the ZIM library).")
+        last = parsed.path.rsplit("/", 1)[-1]
+        if parsed.hostname and not parsed.path.endswith("/") and "." not in last:
+            errors.append("For a folder, end the URL with “/”. Without it the download isn't "
+                          "limited to that folder and would spread to the whole site.")
+
     if scraper == "mwoffliner":
         if not admin_email:
             errors.append("mwoffliner needs a real admin email so wiki operators can contact you.")
@@ -366,6 +414,15 @@ def build_run(job):
             f"--filenamePrefix={job['name']}",
         ] + extra
         return MWOFFLINER_IMAGE, command, {}
+    if job["scraper"] == "mirror":
+        wget_args = [
+            "--recursive", "--level=inf", "--no-parent", "--timestamping", "--no-verbose",
+            "--tries=3", "--timeout=60", f"--wait={MIRROR_WAIT_SECONDS}",
+            # Skip the sort-order links of Apache/nginx folder listings.
+            "--reject-regex=[?&]C=[NMSD];O=[AD]",
+        ] + extra + [job["url"]]
+        command = ["sh", "-c", MIRROR_SCRIPT, "mirror", job["name"]] + wget_args
+        return MIRROR_IMAGE, command, {}
     command = ["zimit", "--seeds", job["url"], "--name", job["name"], "--output", "/output"] + extra
     return ZIMIT_IMAGE, command, {"shm_size": ZIMIT_SHM_SIZE}
 
@@ -397,9 +454,11 @@ def start_container(job_id, job):
             if live["cancel_requested"]:
                 return None
     append_log(job_id, f"Image: {digest}")
-    append_log(job_id, "Command: " + shlex.join(command))
+    shown = ["wget"] + command[5:] if job["scraper"] == "mirror" else command
+    append_log(job_id, "Command: " + shlex.join(shown))
+    host_path = MIRROR_HOST_PATH if job["scraper"] == "mirror" else LIBRARY_HOST_PATH
     kwargs = {
-        "volumes": {LIBRARY_HOST_PATH: {"bind": "/output", "mode": "rw"}},
+        "volumes": {host_path: {"bind": "/output", "mode": "rw"}},
         "detach": True,
         "name": f"zimforge-{job_id}",
         "labels": {"zim-forge.job": job_id},
@@ -442,14 +501,122 @@ def sha256_file(path):
     return h.hexdigest()
 
 
-def preflight_disk(job_id):
+def preflight_disk(job_id, path):
     """Returns an error string if there's too little free space, else None."""
-    free_gb = shutil.disk_usage(LIBRARY_PATH).free / 1024 ** 3
-    append_log(job_id, f"Free space in library: {free_gb:.1f} GB")
+    free_gb = shutil.disk_usage(path).free / 1024 ** 3
+    append_log(job_id, f"Free space for output: {free_gb:.1f} GB")
     if free_gb < MIN_FREE_GB:
-        return (f"Only {free_gb:.1f} GB free in the library folder; at least {MIN_FREE_GB:g} GB "
+        return (f"Only {free_gb:.1f} GB free in the output folder; at least {MIN_FREE_GB:g} GB "
                 "is required (MIN_FREE_GB). Free up space and run the job again.")
     return None
+
+
+def list_tmp_dirs():
+    return sorted(e.name for e in os.scandir(LIBRARY_PATH) if e.name.startswith(".tmp") and e.is_dir())
+
+
+def cleanup_temp_dirs(job_id):
+    """Remove temp folders a failed/cancelled Zimit job left in the library.
+
+    Only folders named .tmp* that did not exist when the job started are touched.
+    """
+    with jobs_lock:
+        before = (jobs.get(job_id) or {}).get("tmp_before")
+    if before is None or not library_available():
+        return
+    for name in list_tmp_dirs():
+        if name in before:
+            continue
+        try:
+            shutil.rmtree(os.path.join(LIBRARY_PATH, name))
+            append_log(job_id, f"Removed leftover temporary folder {name}.")
+        except OSError:
+            append_log(job_id, f"Leftover temporary folder {name} is still in the library. Delete it by "
+                               "hand, or mount the library read-write so ZIM Forge can clean up.")
+
+
+def collect_mirror_outputs(job_id, name):
+    """Summarise a mirror folder. Returns outputs, or None if it isn't mounted here."""
+    if not (MIRROR_PATH and os.path.isdir(MIRROR_PATH)):
+        return None
+    root = os.path.join(MIRROR_PATH, name)
+    count = total = 0
+    for dirpath, _dirs, files in os.walk(root):
+        for filename in files:
+            if filename in ("SHA256SUMS", "SHA256SUMS.tmp"):
+                continue
+            try:
+                total += os.path.getsize(os.path.join(dirpath, filename))
+                count += 1
+            except OSError:
+                pass
+    if not count:
+        return []
+    manifest = os.path.join(root, "SHA256SUMS")
+    digest = sha256_file(manifest) if os.path.exists(manifest) else ""
+    outputs = [{"file": f"{name}/ ({count} files)", "size": total, "sha256": digest,
+                "sha256_label": "SHA-256 of the SHA256SUMS manifest"}]
+    append_log(job_id, f"Output: {name}/  {count} files  {human_size(total)}")
+    with jobs_lock:
+        job = jobs.get(job_id)
+        if job:
+            job["outputs"] = outputs
+    return outputs
+
+
+def restart_kiwix(job_id):
+    if not KIWIX_CONTAINER:
+        return
+    try:
+        docker_client.containers.get(KIWIX_CONTAINER).restart()
+        append_log(job_id, f"Restarted {KIWIX_CONTAINER} so the new ZIM shows up in Kiwix.")
+    except Exception as e:
+        append_log(job_id, f"Couldn't restart {KIWIX_CONTAINER}: {e}")
+
+
+def conclude(job_id, exit_code):
+    """Decide success or failure for a scraper that ran to the end."""
+    with jobs_lock:
+        job = jobs.get(job_id)
+        if not job:
+            return
+        scraper, name = job["scraper"], job["name"]
+
+    if scraper == "mirror":
+        if exit_code == 91:
+            append_log(job_id, "Nothing was downloaded. Check the URL, and the log above for errors.")
+            finish_job(job_id, "failed", exit_code)
+            return
+        if exit_code not in MIRROR_OK_EXIT_CODES:
+            append_log(job_id, f"wget exited with code {exit_code}. Run the job again to resume; "
+                               "files already downloaded are kept.")
+            finish_job(job_id, "failed", exit_code)
+            return
+        outputs = collect_mirror_outputs(job_id, name)
+        if outputs is not None and not outputs:
+            append_log(job_id, "Nothing was downloaded. Treating this as a failure.")
+            finish_job(job_id, "failed", exit_code)
+            return
+        if exit_code == 8:
+            note = "Some files could not be downloaded. Search the full log for “ERROR” to see which."
+            append_log(job_id, "WARNING: " + note)
+            with jobs_lock:
+                job["note"] = note
+        finish_job(job_id, "success", exit_code)
+        return
+
+    if exit_code != 0:
+        append_log(job_id, f"Scraper exited with code {exit_code}.")
+        finish_job(job_id, "failed", exit_code)
+        return
+    outputs = collect_outputs(job_id)
+    if outputs is not None and not outputs:
+        append_log(job_id, "Scraper exited cleanly but no new ZIM file appeared in the library. "
+                           "Treating this as a failure.")
+        finish_job(job_id, "failed", exit_code)
+        return
+    restart_kiwix(job_id)
+    finish_job(job_id, "success", exit_code)
 
 
 def collect_outputs(job_id):
@@ -570,17 +737,8 @@ def supervise(job_id, container, reattached=False):
             finish_job(job_id, "cancelled", exit_code)
         elif timed_out.is_set():
             finish_job(job_id, "failed", exit_code)
-        elif exit_code != 0:
-            append_log(job_id, f"Scraper exited with code {exit_code}.")
-            finish_job(job_id, "failed", exit_code)
         else:
-            outputs = collect_outputs(job_id)
-            if outputs is not None and not outputs:
-                append_log(job_id, "Scraper exited cleanly but no new ZIM file appeared in the library. "
-                                   "Treating this as a failure.")
-                finish_job(job_id, "failed", exit_code)
-            else:
-                finish_job(job_id, "success", exit_code)
+            conclude(job_id, exit_code)
     finally:
         if timer:
             timer.cancel()
@@ -617,14 +775,19 @@ def run_job(job_id):
             finish_job(job_id, "failed")
             return
 
-    if library_available():
-        problem = preflight_disk(job_id)
+    is_mirror = spec["scraper"] == "mirror"
+    out_path = MIRROR_PATH if is_mirror else LIBRARY_PATH
+    if out_path and os.path.isdir(out_path):
+        problem = preflight_disk(job_id, out_path)
         if problem:
             append_log(job_id, problem)
             finish_job(job_id, "failed")
             return
-        with jobs_lock:
-            job["zims_before"] = list_zims()
+        if not is_mirror:
+            with jobs_lock:
+                job["zims_before"] = list_zims()
+                if spec["scraper"] == "zimit":
+                    job["tmp_before"] = list_tmp_dirs()
 
     container = None
     try:
@@ -680,13 +843,7 @@ def reattach(job_id, container_id):
     else:
         exit_code = container.attrs.get("State", {}).get("ExitCode", 1)
         append_log(job_id, f"Scraper finished while the app was down (exit code {exit_code}).")
-        ok = exit_code == 0
-        if ok:
-            outputs = collect_outputs(job_id)
-            if outputs is not None and not outputs:
-                append_log(job_id, "No new ZIM file appeared in the library. Treating this as a failure.")
-                ok = False
-        finish_job(job_id, "success" if ok else "failed", exit_code)
+        conclude(job_id, exit_code)
         try:
             container.remove(force=True)
         except Exception:
@@ -761,7 +918,8 @@ def sorted_public_jobs():
 
 @app.route("/")
 def index():
-    return render_template("index.html", jobs=sorted_public_jobs(), errors=[], form={})
+    return render_template("index.html", jobs=sorted_public_jobs(), errors=[], form={},
+                           mirror_enabled=bool(MIRROR_HOST_PATH))
 
 
 @app.route("/submit", methods=["POST"])
@@ -769,7 +927,8 @@ def index():
 def submit():
     values, errors = validate_submission(request.form)
     if errors:
-        return render_template("index.html", jobs=sorted_public_jobs(), errors=errors, form=values), 400
+        return render_template("index.html", jobs=sorted_public_jobs(), errors=errors, form=values,
+                               mirror_enabled=bool(MIRROR_HOST_PATH)), 400
     new_job(**values)
     return redirect(url_for("index"))
 

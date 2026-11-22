@@ -1,10 +1,15 @@
 # ZIM Forge
 
 A small web UI for turning websites into ZIM files for [Kiwix](https://kiwix.org).
-It queues jobs and runs [Zimit](https://github.com/openzim/zimit) (any website) or
-[mwoffliner](https://github.com/openzim/mwoffliner) (MediaWiki sites) as sibling
-Docker containers, one job at a time. Finished ZIMs are written straight into your
-Kiwix library folder.
+It queues jobs and runs them as sibling Docker containers, one at a time.
+
+| Job type | Use it for | Result |
+|---|---|---|
+| **Zimit** | Any website | A ZIM file in your Kiwix library |
+| **mwoffliner** | MediaWiki sites (most wikis) | A ZIM file in your Kiwix library |
+| **File mirror** | Folders of files: file repositories, download archives | The files as-is, in their original folder structure, plus a `SHA256SUMS` manifest |
+
+Use the ZIM types for things you read and File mirror for things you download.
 
 ## Running it
 
@@ -33,6 +38,26 @@ The included `docker-compose.yml` also mounts the library into ZIM Forge itself
 (at `/library`), which enables the free-space check and output verification
 described below.
 
+## File mirror jobs
+
+A File mirror job runs `wget` against a folder URL and stores the result under
+`MIRROR_HOST_PATH/<job name>/<hostname>/…`.
+
+- The URL of a folder **must end with `/`**. The download never goes above that
+  folder.
+- When it finishes, a `SHA256SUMS` file covering every downloaded file is
+  written into the job's folder. Check a copy later with `sha256sum -c SHA256SUMS`.
+- Running the job again (same name) resumes and updates: files already
+  downloaded and unchanged are skipped.
+- If a few files fail (dead links), the job still succeeds but carries a note;
+  search the full log for `ERROR`.
+- Advanced options are passed to `wget`, for example `--level=2` or
+  `--accept "*.zip,*.7z"`.
+- It respects the site's `robots.txt` and waits `MIRROR_WAIT_SECONDS` between files.
+
+It works on sites that serve plain folder listings or ordinary links. Sites whose
+file browser is built with JavaScript can't be mirrored this way.
+
 ## What a job records
 
 Each job keeps what's needed to trust the result later:
@@ -44,6 +69,8 @@ Each job keeps what's needed to trust the result later:
 - **Full log.** The page shows the last 500 lines; the complete timestamped log
   is kept in `data/logs/` and can be downloaded from the job's details.
 - **Free-space check.** A job won't start with less than `MIN_FREE_GB` free.
+- **Cleanup.** Temp folders a failed or cancelled Zimit crawl leaves in the
+  library are removed (needs the library mounted read-write).
 
 Verification and the free-space check need `LIBRARY_PATH` (set for you in the
 compose file). Without it, success is judged by the scraper's exit code alone.
@@ -63,6 +90,11 @@ compose file). Without it, success is judged by the scraper's exit code alone.
 | `PULL_IMAGES` | `true` | Check for a newer scraper image before each job. |
 | `SCRAPER_MEMORY` | *(none)* | Memory cap for scraper containers, e.g. `8g`. |
 | `SCRAPER_CPUS` | *(none)* | CPU cap for scraper containers, e.g. `4`. |
+| `MIRROR_HOST_PATH` | *(unset)* | Folder on the Docker host for File mirror downloads. Required to enable that job type. |
+| `MIRROR_PATH` | *(unset)* | Where that folder is mounted inside ZIM Forge's own container. Enables file counts and the free-space check for mirrors. |
+| `MIRROR_WAIT_SECONDS` | `0.5` | Pause between downloads, to go easy on the server. |
+| `MIRROR_IMAGE` | `ghcr.io/rastrumquill/zim-forge:latest` | Image that provides `wget` for mirror jobs. |
+| `KIWIX_CONTAINER` | *(unset)* | Name of your kiwix-serve container. Restarted after each new ZIM so it shows up. |
 | `ZIMIT_SHM_SIZE` | `1g` | Shared memory for Zimit's Chromium. Lower values crash on big sites. |
 | `JOB_TIMEOUT_HOURS` | `0` (none) | Stop and fail jobs that run longer than this. |
 | `MAX_JOBS_KEPT` | `100` | Oldest finished jobs beyond this are removed from history. |

@@ -37,12 +37,16 @@
         <label>Scraper</label>
         <div class="radio-row">
           <label class="radio-option">
-            <input type="radio" name="scraper" value="zimit" {% if form.scraper != 'mwoffliner' %}checked{% endif %}>
+            <input type="radio" name="scraper" value="zimit" {% if form.scraper not in ('mwoffliner', 'mirror') %}checked{% endif %}>
             Zimit <span class="hint">— generic site, any web page</span>
           </label>
           <label class="radio-option">
             <input type="radio" name="scraper" value="mwoffliner" {% if form.scraper == 'mwoffliner' %}checked{% endif %}>
             mwoffliner <span class="hint">— MediaWiki sites (Fandom, most wikis)</span>
+          </label>
+          <label class="radio-option">
+            <input type="radio" name="scraper" value="mirror" {% if form.scraper == 'mirror' %}checked{% endif %} {% if not mirror_enabled %}disabled{% endif %}>
+            File mirror <span class="hint">— download a folder of files as-is, with checksums (file repositories, download archives){% if not mirror_enabled %} — set <code>MIRROR_HOST_PATH</code> to enable{% endif %}</span>
           </label>
         </div>
       </div>
@@ -60,6 +64,8 @@
           the default (which only follows links under the same directory as your URL) — use
           this whenever the site you want has pages living outside that directory.
           <code>--depth N</code> limits crawl depth. For mwoffliner, e.g. <code>--format=nopic</code>.
+          For File mirror these are <code>wget</code> flags, e.g. <code>--level=2</code> or
+          <code>--accept "*.zip,*.7z"</code>; the URL of a folder must end with <code>/</code>.
           Output location and filename flags are set by ZIM Forge and can't be overridden here.
         </p>
       </div>
@@ -146,7 +152,7 @@
       r.cancelBtn.hidden = !active;
       r.retryBtn.hidden = active;
       r.logRow.hidden = !openLogs.has(job.id);
-      const sig = JSON.stringify([job.status, job.outputs, job.image_digest, job.finished_at]);
+      const sig = JSON.stringify([job.status, job.outputs, job.image_digest, job.finished_at, job.note]);
       if (r.detailsSig !== sig) { r.detailsSig = sig; renderDetails(r.details, job); }
     }
 
@@ -167,8 +173,9 @@
       if (job.finished_at) line('Finished', fmtTime(job.finished_at));
       for (const out of job.outputs || []) {
         line('Output', `${out.file} (${fmtSize(out.size)})`);
-        line('SHA-256', el('code', {textContent: out.sha256}));
+        if (out.sha256) line(out.sha256_label || 'SHA-256', el('code', {textContent: out.sha256}));
       }
+      if (job.note) line('Note', job.note);
       line('', el('a', {href: 'logs/' + encodeURIComponent(job.id) + '/full', textContent: 'Download full log'}));
     }
 
