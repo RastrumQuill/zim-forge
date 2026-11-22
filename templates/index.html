@@ -2,6 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>ZIM Forge</title>
   <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
 </head>
@@ -12,44 +13,54 @@
   </header>
 
   <main>
-    <form id="submit-form" action="/submit" method="post">
+    {% if errors %}
+    <div class="notice error" role="alert">
+      <strong>Job not started:</strong>
+      <ul>{% for e in errors %}<li>{{ e }}</li>{% endfor %}</ul>
+    </div>
+    {% endif %}
+
+    <form id="submit-form" action="{{ url_for('submit') }}" method="post">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+
       <div class="field">
         <label for="url">Site URL</label>
-        <input type="url" id="url" name="url" placeholder="https://example.com/docs/" required>
+        <input type="url" id="url" name="url" placeholder="https://example.com/docs/" required value="{{ form.url or '' }}">
       </div>
 
       <div class="field">
-        <label for="name">Name <span class="hint">(used as the ZIM filename — optional, derived from URL if blank)</span></label>
-        <input type="text" id="name" name="name" placeholder="my-archive">
+        <label for="name">Name <span class="hint">(used as the ZIM filename — letters, numbers, <code>.</code> <code>_</code> <code>-</code>; optional, derived from URL if blank)</span></label>
+        <input type="text" id="name" name="name" placeholder="my-archive" maxlength="80" value="{{ form.name or '' }}">
       </div>
 
       <div class="field">
         <label>Scraper</label>
         <div class="radio-row">
           <label class="radio-option">
-            <input type="radio" name="scraper" value="zimit" checked onchange="toggleScraperFields()">
+            <input type="radio" name="scraper" value="zimit" {% if form.scraper != 'mwoffliner' %}checked{% endif %}>
             Zimit <span class="hint">— generic site, any web page</span>
           </label>
           <label class="radio-option">
-            <input type="radio" name="scraper" value="mwoffliner" onchange="toggleScraperFields()">
+            <input type="radio" name="scraper" value="mwoffliner" {% if form.scraper == 'mwoffliner' %}checked{% endif %}>
             mwoffliner <span class="hint">— MediaWiki sites (Fandom, most wikis)</span>
           </label>
         </div>
       </div>
 
-      <div class="field" id="admin-email-field" style="display:none;">
-        <label for="admin_email">Admin email <span class="hint">(required by mwoffliner — used to identify the crawler to the wiki, not stored anywhere else)</span></label>
-        <input type="email" id="admin_email" name="admin_email" placeholder="you@example.com">
+      <div class="field" id="admin-email-field" hidden>
+        <label for="admin_email">Admin email <span class="hint">(required by mwoffliner — sent to the wiki so its operators can contact you about the crawl)</span></label>
+        <input type="email" id="admin_email" name="admin_email" placeholder="you@example.com" value="{{ form.admin_email or '' }}">
       </div>
 
       <div class="field">
         <label for="extra_args">Advanced options <span class="hint">(optional — raw flags appended to the scraper command, exactly as you'd type them on the command line)</span></label>
-        <input type="text" id="extra_args" name="extra_args" placeholder='--scopeIncludeRx "https://example.com/(path1|path2)/.*"'>
+        <input type="text" id="extra_args" name="extra_args" placeholder='--scopeIncludeRx "https://example.com/(path1|path2)/.*"' value="{{ form.extra_args or '' }}">
         <p class="hint" style="margin-top:6px;">
           Common ones: <code>--scopeIncludeRx "regex"</code> to widen Zimit's crawl scope beyond
           the default (which only follows links under the same directory as your URL) — use
           this whenever the site you want has pages living outside that directory.
           <code>--depth N</code> limits crawl depth. For mwoffliner, e.g. <code>--format=nopic</code>.
+          Output location and filename flags are set by ZIM Forge and can't be overridden here.
         </p>
       </div>
 
@@ -58,92 +69,149 @@
 
     <section>
       <h2>Jobs</h2>
+      <div class="notice error" id="conn-error" hidden>Can't reach ZIM Forge — retrying…</div>
       <table id="jobs-table">
         <thead>
           <tr>
             <th>Name</th>
             <th>Scraper</th>
             <th>Status</th>
-            <th>Started</th>
-            <th>Log</th>
+            <th>Created</th>
+            <th></th>
           </tr>
         </thead>
-        <tbody id="jobs-body">
-          {% for job in jobs %}
-          <tr>
-            <td>{{ job.name }}</td>
-            <td>{{ job.scraper }}</td>
-            <td><span class="badge status-{{ job.status }}">{{ job.status }}</span></td>
-            <td>{{ job.created_at }}</td>
-            <td><button class="log-btn" onclick="toggleLog('{{ job.id }}')">view</button></td>
-          </tr>
-          <tr class="log-row" id="log-row-{{ job.id }}" style="display:none;">
-            <td colspan="5"><pre id="log-{{ job.id }}" class="log-box">loading…</pre></td>
-          </tr>
-          {% endfor %}
-        </tbody>
+        <tbody id="jobs-body"></tbody>
       </table>
+      <p class="hint" id="no-jobs" hidden>No jobs yet.</p>
     </section>
   </main>
 
   <script>
+    const CSRF_TOKEN = {{ csrf_token()|tojson }};
+    let jobsData = {{ jobs|tojson }};
+    const openLogs = new Set();
+    const rows = new Map();  // job id -> {row, logRow, cells...}
+
     function toggleScraperFields() {
       const isWiki = document.querySelector('input[name="scraper"]:checked').value === 'mwoffliner';
-      document.getElementById('admin-email-field').style.display = isWiki ? 'block' : 'none';
+      document.getElementById('admin-email-field').hidden = !isWiki;
+      document.getElementById('admin_email').required = isWiki;
+    }
+    document.querySelectorAll('input[name="scraper"]').forEach(r => r.addEventListener('change', toggleScraperFields));
+    toggleScraperFields();
+
+    function fmtTime(iso) {
+      if (!iso) return '';
+      const d = new Date(iso);
+      return isNaN(d) ? iso : d.toLocaleString();
     }
 
-    const openLogs = new Set();
+    function el(tag, props = {}, children = []) {
+      const node = document.createElement(tag);
+      Object.assign(node, props);
+      for (const c of children) node.append(c);
+      return node;
+    }
+
+    function buildRow(job) {
+      const name = el('td', {title: job.url});
+      const scraper = el('td');
+      const badge = el('span');
+      const status = el('td', {}, [badge]);
+      const created = el('td');
+      const logBtn = el('button', {className: 'log-btn', type: 'button', textContent: 'log'});
+      const cancelBtn = el('button', {className: 'log-btn cancel-btn', type: 'button', textContent: 'cancel'});
+      const actions = el('td', {className: 'actions'}, [logBtn, cancelBtn]);
+      const row = el('tr', {}, [name, scraper, status, created, actions]);
+
+      const logBox = el('pre', {className: 'log-box', textContent: 'loading…'});
+      const logRow = el('tr', {className: 'log-row', hidden: true}, [el('td', {colSpan: 5}, [logBox])]);
+
+      logBtn.addEventListener('click', () => toggleLog(job.id));
+      cancelBtn.addEventListener('click', () => cancelJob(job.id, cancelBtn));
+      return {row, logRow, logBox, name, scraper, badge, created, cancelBtn};
+    }
+
+    function updateRow(r, job) {
+      r.name.textContent = job.name;
+      r.name.title = job.url;
+      r.scraper.textContent = job.scraper;
+      r.badge.textContent = job.status;
+      r.badge.className = 'badge status-' + job.status;
+      r.created.textContent = fmtTime(job.created_at);
+      r.cancelBtn.hidden = !(job.status === 'queued' || job.status === 'running');
+      r.logRow.hidden = !openLogs.has(job.id);
+    }
+
+    function render() {
+      const tbody = document.getElementById('jobs-body');
+      const seen = new Set();
+      for (const job of jobsData) {
+        seen.add(job.id);
+        let r = rows.get(job.id);
+        if (!r) { r = buildRow(job); rows.set(job.id, r); }
+        updateRow(r, job);
+        tbody.append(r.row, r.logRow);  // append moves existing nodes into order
+      }
+      for (const [id, r] of rows) {
+        if (!seen.has(id)) { r.row.remove(); r.logRow.remove(); rows.delete(id); openLogs.delete(id); }
+      }
+      document.getElementById('no-jobs').hidden = jobsData.length > 0;
+    }
 
     function toggleLog(jobId) {
-      const row = document.getElementById('log-row-' + jobId);
-      const isOpen = row.style.display !== 'none';
-      row.style.display = isOpen ? 'none' : 'table-row';
-      if (isOpen) {
-        openLogs.delete(jobId);
-      } else {
-        openLogs.add(jobId);
-        refreshLog(jobId);
-      }
+      if (openLogs.has(jobId)) openLogs.delete(jobId); else openLogs.add(jobId);
+      const r = rows.get(jobId);
+      if (r) r.logRow.hidden = !openLogs.has(jobId);
+      if (openLogs.has(jobId)) refreshLog(jobId);
     }
 
     async function refreshLog(jobId) {
-      const res = await fetch('/logs/' + jobId);
-      const text = await res.text();
-      const box = document.getElementById('log-' + jobId);
-      if (box) {
+      const r = rows.get(jobId);
+      if (!r) return;
+      try {
+        const res = await fetch('logs/' + encodeURIComponent(jobId), {credentials: 'same-origin'});
+        if (!res.ok) return;
+        const text = await res.text();
+        const box = r.logBox;
+        const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 20;
         box.textContent = text || '(no output yet)';
-        box.scrollTop = box.scrollHeight;
+        if (atBottom) box.scrollTop = box.scrollHeight;
+      } catch (e) { /* connection banner is handled by refreshJobs */ }
+    }
+
+    async function cancelJob(jobId, btn) {
+      if (!confirm('Cancel this job?')) return;
+      btn.disabled = true;
+      try {
+        const res = await fetch('jobs/' + encodeURIComponent(jobId) + '/cancel', {
+          method: 'POST', credentials: 'same-origin', headers: {'X-CSRF-Token': CSRF_TOKEN},
+        });
+        if (!res.ok) {
+          const data = await res.json().catch(() => ({}));
+          alert('Could not cancel: ' + (data.error || res.status));
+        }
+      } finally {
+        btn.disabled = false;
+        refreshJobs();
       }
     }
 
     async function refreshJobs() {
-      const res = await fetch('/jobs');
-      const jobsData = await res.json();
-      const tbody = document.getElementById('jobs-body');
-      tbody.innerHTML = '';
-      for (const job of jobsData) {
-        const row = document.createElement('tr');
-        row.innerHTML = `
-          <td>${job.name}</td>
-          <td>${job.scraper}</td>
-          <td><span class="badge status-${job.status}">${job.status}</span></td>
-          <td>${job.created_at}</td>
-          <td><button class="log-btn" onclick="toggleLog('${job.id}')">view</button></td>
-        `;
-        tbody.appendChild(row);
-
-        const logRow = document.createElement('tr');
-        logRow.className = 'log-row';
-        logRow.id = 'log-row-' + job.id;
-        logRow.style.display = openLogs.has(job.id) ? 'table-row' : 'none';
-        logRow.innerHTML = `<td colspan="5"><pre id="log-${job.id}" class="log-box">loading…</pre></td>`;
-        tbody.appendChild(logRow);
-      }
-      for (const jobId of openLogs) {
-        refreshLog(jobId);
+      const banner = document.getElementById('conn-error');
+      try {
+        const res = await fetch('jobs', {credentials: 'same-origin'});
+        if (!res.ok) throw new Error(res.status);
+        jobsData = await res.json();
+        banner.hidden = true;
+        render();
+        for (const jobId of openLogs) refreshLog(jobId);
+      } catch (e) {
+        banner.hidden = false;
       }
     }
 
+    render();
     setInterval(refreshJobs, 4000);
   </script>
 </body>
